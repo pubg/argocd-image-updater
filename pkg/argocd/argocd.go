@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -13,6 +14,7 @@ import (
 	"github.com/argoproj/argo-cd/v3/pkg/apiclient/application"
 	argocdapi "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/argo-cd/v3/util/db"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -92,6 +94,49 @@ func (client *ArgoCDK8sClient) UpdateSpec(ctx context.Context, spec *application
 }
 
 // nameMatchesPatterns Matches a name against a list of patterns
+// ErrSpecChanged is returned when another client changed the Application spec
+// after it was read for the current update cycle.
+var ErrSpecChanged = errors.New("application spec was changed after it was read")
+
+// ConditionalSpecUpdater writes a new Application spec only while the live
+// spec still equals the spec the new one was computed from.
+type ConditionalSpecUpdater interface {
+	UpdateSpecIfUnchanged(ctx context.Context, app *argocdapi.Application, baseSpec *argocdapi.ApplicationSpec) (*argocdapi.ApplicationSpec, error)
+}
+
+// UpdateSpecIfUnchanged writes app.Spec if the live spec still equals baseSpec
+// and returns ErrSpecChanged otherwise.
+//
+// UpdateSpec puts the spec read at the start of the cycle onto a freshly read
+// object, so the update carries the latest resourceVersion and silently reverts
+// spec changes made by other clients in the meantime. Comparing specs instead
+// of resourceVersions lets status-only changes by the application controller
+// through. If GetApplication is served from a stale informer cache, the Update
+// carries the stale resourceVersion and fails with a conflict, so the spec is
+// compared again on the next attempt.
+func (client *ArgoCDK8sClient) UpdateSpecIfUnchanged(ctx context.Context, app *argocdapi.Application, baseSpec *argocdapi.ApplicationSpec) (*argocdapi.ApplicationSpec, error) {
+	var live *argocdapi.Application
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var err error
+		live, err = client.GetApplication(ctx, app.Namespace, app.Name)
+		if err != nil {
+			return err
+		}
+		if !equality.Semantic.DeepEqual(live.Spec, *baseSpec) {
+			return ErrSpecChanged
+		}
+		live.Spec = *app.Spec.DeepCopy()
+		return client.Update(ctx, live)
+	})
+	if errors.Is(err, ErrSpecChanged) {
+		return nil, ErrSpecChanged
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to update application spec for %s after retries: %w", app.Name, err)
+	}
+	return &live.Spec, nil
+}
+
 func nameMatchesPatterns(ctx context.Context, name string, patterns []string) bool {
 	if len(patterns) == 0 {
 		return true

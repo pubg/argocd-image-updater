@@ -111,6 +111,10 @@ type WriteBackConfig struct {
 	PRProvider             PRProvider
 	PRLabels               []string
 	PullRequest            *PullRequest
+	// BaseSpec is the Application spec the update was computed from. If set
+	// and ArgoClient supports it, the live spec is only written while it
+	// still equals BaseSpec.
+	BaseSpec *argocdapi.ApplicationSpec
 }
 
 // WriteBackTargetKey returns a short hash that uniquely identifies the
