@@ -2551,6 +2551,91 @@ registries:
 	})
 }
 
+func Test_UpdateApplicationConcurrentSpecChange(t *testing.T) {
+	const ns = "argocd"
+	initialApp := &v1alpha1.Application{
+		ObjectMeta: v1.ObjectMeta{Name: "demo", Namespace: ns},
+		Spec: v1alpha1.ApplicationSpec{
+			Source: &v1alpha1.ApplicationSource{
+				RepoURL: "https://example.com/charts",
+				Chart:   "demo",
+				Helm: &v1alpha1.ApplicationSourceHelm{
+					Parameters: []v1alpha1.HelmParameter{
+						{Name: "image.name", Value: "gcr.io/example/demo", ForceString: true},
+						{Name: "image.tag", Value: "1.0.0", ForceString: true},
+					},
+				},
+			},
+			Destination: v1alpha1.ApplicationDestination{Server: "https://kubernetes.default.svc", Namespace: "old-ns"},
+		},
+		Status: v1alpha1.ApplicationStatus{
+			SourceType: v1alpha1.ApplicationSourceTypeHelm,
+			Summary:    v1alpha1.ApplicationSummary{Images: []string{"gcr.io/example/demo:1.0.0"}},
+		},
+	}
+	argoClient, err := newTestK8sClient(initialApp)
+	require.NoError(t, err)
+	kubeClient := kube.ImageUpdaterKubernetesClient{
+		KubeClient: &registryKube.KubernetesClient{Clientset: fake.NewFakeKubeClient()},
+	}
+	getLive := func(t *testing.T) *v1alpha1.Application {
+		t.Helper()
+		live, err := argoClient.GetApplication(context.Background(), ns, "demo")
+		require.NoError(t, err)
+		return live
+	}
+
+	runCycle := func(t *testing.T, duringRegistryLookup func()) ImageUpdaterResult {
+		t.Helper()
+		listed := getLive(t)
+		appImages := &ApplicationImages{
+			Application:     *listed,
+			WriteBackConfig: &WriteBackConfig{Method: WriteBackApplication},
+			Images:          ImageList{NewImage(image.NewFromIdentifier("demo=gcr.io/example/demo"))},
+		}
+		mockClientFn := func(endpoint *registry.RegistryEndpoint, username, password string) (registry.RegistryClient, error) {
+			regMock := regmock.RegistryClient{}
+			regMock.On("NewRepository", mock.Anything, mock.Anything).Return(nil)
+			regMock.On("Tags", mock.Anything).Run(func(mock.Arguments) {
+				if duringRegistryLookup != nil {
+					duringRegistryLookup()
+				}
+			}).Return([]string{"1.0.0", "1.0.1"}, nil)
+			return &regMock, nil
+		}
+		return UpdateApplication(context.Background(), &UpdateConfiguration{
+			NewRegFN:          mockClientFn,
+			ArgoClient:        argoClient,
+			KubeClient:        &kubeClient,
+			UpdateApp:         appImages,
+			DisableKubeEvents: true,
+		}, NewSyncIterationState())
+	}
+
+	// Another client (for example Terraform) changes the destination after the
+	// cycle read the Application and before it writes the new image tag.
+	res := runCycle(t, func() {
+		live := getLive(t)
+		live.Spec.Destination.Namespace = "new-ns"
+		require.NoError(t, argoClient.Update(context.Background(), live))
+	})
+	assert.Equal(t, 0, res.NumErrors)
+	assert.Equal(t, 0, res.NumImagesUpdated)
+
+	live := getLive(t)
+	assert.Equal(t, "new-ns", live.Spec.Destination.Namespace, "concurrent spec change must not be reverted")
+	assert.Equal(t, "1.0.0", live.Spec.Source.Helm.Parameters[1].Value)
+
+	// The next cycle reads the new spec and writes the new tag on top of it.
+	res = runCycle(t, nil)
+	assert.Equal(t, 0, res.NumErrors)
+	assert.Equal(t, 1, res.NumImagesUpdated)
+
+	live = getLive(t)
+	assert.Equal(t, "new-ns", live.Spec.Destination.Namespace)
+	assert.Equal(t, "1.0.1", live.Spec.Source.Helm.Parameters[1].Value)
+}
+
 func Test_MarshalParamsOverride(t *testing.T) {
 	t.Run("Valid Kustomize source", func(t *testing.T) {
 		expected := `

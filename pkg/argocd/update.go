@@ -46,6 +46,7 @@ func UpdateApplication(ctx context.Context, updateConf *UpdateConfiguration, sta
 	appNs := updateConf.UpdateApp.Application.GetNamespace()
 
 	changeList := make([]ChangeEntry, 0)
+	baseSpec := updateConf.UpdateApp.Application.Spec.DeepCopy()
 
 	// Get all images that are deployed with the current application
 	applicationImages := GetImagesFromApplication(updateConf.UpdateApp)
@@ -298,6 +299,7 @@ func UpdateApplication(ctx context.Context, updateConf *UpdateConfiguration, sta
 
 	wbc := updateConf.UpdateApp.WriteBackConfig
 	wbc.ArgoClient = updateConf.ArgoClient
+	wbc.BaseSpec = baseSpec
 
 	if updateConf.GitCreds == nil {
 		wbc.GitCreds = git.NoopCredsStore{}
@@ -328,7 +330,10 @@ func UpdateApplication(ctx context.Context, updateConf *UpdateConfiguration, sta
 		if !updateConf.DryRun {
 			baseLogger.Infof("Committing %d parameter update(s) for application %s", result.NumImagesUpdated, app)
 			err := commitChangesLocked(ctx, updateConf.UpdateApp, state, changeList)
-			if err != nil {
+			if errors.Is(err, ErrSpecChanged) {
+				baseLogger.Warnf("Application spec was changed by another client during this cycle, not updating it until the next cycle")
+				result.NumImagesUpdated = 0
+			} else if err != nil {
 				baseLogger.Errorf("Could not update application spec: %v", err)
 				result.NumErrors += 1
 				result.NumImagesUpdated = 0
@@ -1281,11 +1286,16 @@ func commitChanges(ctx context.Context, applicationImages *ApplicationImages, ch
 	}
 	switch wbc.Method {
 	case WriteBackApplication:
-		_, err := wbc.ArgoClient.UpdateSpec(ctx, &application.ApplicationUpdateSpecRequest{
-			Name:         &app.Name,
-			AppNamespace: &app.Namespace,
-			Spec:         &app.Spec,
-		})
+		var err error
+		if updater, ok := wbc.ArgoClient.(ConditionalSpecUpdater); ok && wbc.BaseSpec != nil {
+			_, err = updater.UpdateSpecIfUnchanged(ctx, &app, wbc.BaseSpec)
+		} else {
+			_, err = wbc.ArgoClient.UpdateSpec(ctx, &application.ApplicationUpdateSpecRequest{
+				Name:         &app.Name,
+				AppNamespace: &app.Namespace,
+				Spec:         &app.Spec,
+			})
+		}
 		if err != nil {
 			return false, err
 		}

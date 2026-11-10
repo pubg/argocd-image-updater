@@ -16,6 +16,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlFake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	api "github.com/argoproj-labs/argocd-image-updater/api/v1alpha1"
 	"github.com/argoproj-labs/argocd-image-updater/pkg/common"
@@ -5486,4 +5487,124 @@ func Test_countPullRequestProviders(t *testing.T) {
 			assert.Equal(t, tt.expected, countPullRequestProviders(tt.pr))
 		})
 	}
+}
+
+func TestKubernetesClientUpdateSpecIfUnchanged(t *testing.T) {
+	baseSpec := func() v1alpha1.ApplicationSpec {
+		return v1alpha1.ApplicationSpec{
+			Source: &v1alpha1.ApplicationSource{
+				RepoURL: "https://example.com/charts",
+				Chart:   "demo",
+				Helm: &v1alpha1.ApplicationSourceHelm{
+					Parameters: []v1alpha1.HelmParameter{{Name: "image.tag", Value: "1.0.0", ForceString: true}},
+				},
+			},
+			Destination: v1alpha1.ApplicationDestination{Server: "https://kubernetes.default.svc", Namespace: "old-ns"},
+		}
+	}
+	liveApp := func(spec v1alpha1.ApplicationSpec) *v1alpha1.Application {
+		return &v1alpha1.Application{
+			ObjectMeta: v1.ObjectMeta{Name: "test-app", Namespace: "testns"},
+			Spec:       spec,
+			Status:     v1alpha1.ApplicationStatus{Sync: v1alpha1.SyncStatus{Status: v1alpha1.SyncStatusCodeSynced}},
+		}
+	}
+	newApp := func() *v1alpha1.Application {
+		spec := baseSpec()
+		spec.Source.Helm.Parameters[0].Value = "1.0.1"
+		return &v1alpha1.Application{ObjectMeta: v1.ObjectMeta{Name: "test-app", Namespace: "testns"}, Spec: spec}
+	}
+	newClient := func(t *testing.T, funcs *interceptor.Funcs, objs ...client.Object) *ArgoCDK8sClient {
+		t.Helper()
+		scheme := runtime.NewScheme()
+		require.NoError(t, v1alpha1.AddToScheme(scheme))
+		builder := ctrlFake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...)
+		if funcs != nil {
+			builder = builder.WithInterceptorFuncs(*funcs)
+		}
+		c, err := NewArgoCDK8sClient(builder.Build())
+		require.NoError(t, err)
+		return c
+	}
+	getLive := func(t *testing.T, c *ArgoCDK8sClient) *v1alpha1.Application {
+		t.Helper()
+		live, err := c.GetApplication(context.Background(), "testns", "test-app")
+		require.NoError(t, err)
+		return live
+	}
+
+	t.Run("Writes the spec and keeps the live status when the spec is unchanged", func(t *testing.T) {
+		base := baseSpec()
+		c := newClient(t, nil, liveApp(base))
+
+		spec, err := c.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		require.NoError(t, err)
+		assert.Equal(t, "1.0.1", spec.Source.Helm.Parameters[0].Value)
+
+		live := getLive(t, c)
+		assert.Equal(t, "1.0.1", live.Spec.Source.Helm.Parameters[0].Value)
+		assert.Equal(t, v1alpha1.SyncStatusCodeSynced, live.Status.Sync.Status)
+	})
+
+	t.Run("Does not revert a spec change made by another client after the spec was read", func(t *testing.T) {
+		base := baseSpec()
+		changed := baseSpec()
+		changed.Destination.Namespace = "new-ns"
+		c := newClient(t, nil, liveApp(changed))
+
+		_, err := c.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		require.ErrorIs(t, err, ErrSpecChanged)
+
+		live := getLive(t, c)
+		assert.Equal(t, "new-ns", live.Spec.Destination.Namespace)
+		assert.Equal(t, "1.0.0", live.Spec.Source.Helm.Parameters[0].Value)
+	})
+
+	t.Run("Compares the spec again after a conflict", func(t *testing.T) {
+		base := baseSpec()
+		attempts := 0
+		c := newClient(t, &interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				attempts++
+				// Another client changes the spec between our Get and Update.
+				current := &v1alpha1.Application{}
+				require.NoError(t, cl.Get(ctx, client.ObjectKeyFromObject(obj), current))
+				current.Spec.Destination.Namespace = "new-ns"
+				require.NoError(t, cl.Update(ctx, current))
+				return cl.Update(ctx, obj, opts...)
+			},
+		}, liveApp(base))
+
+		_, err := c.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		require.ErrorIs(t, err, ErrSpecChanged)
+		assert.Equal(t, 1, attempts)
+		assert.Equal(t, "new-ns", getLive(t, c).Spec.Destination.Namespace)
+	})
+
+	t.Run("Retries a conflict when the spec is still unchanged", func(t *testing.T) {
+		base := baseSpec()
+		attempts := 0
+		c := newClient(t, &interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				attempts++
+				if attempts == 1 {
+					return errors.NewConflict(v1alpha1.Resource("applications"), obj.GetName(), fmt.Errorf("conflict"))
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		}, liveApp(base))
+
+		_, err := c.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		require.NoError(t, err)
+		assert.Equal(t, 2, attempts)
+		assert.Equal(t, "1.0.1", getLive(t, c).Spec.Source.Helm.Parameters[0].Value)
+	})
+
+	t.Run("Returns an error when the application does not exist", func(t *testing.T) {
+		base := baseSpec()
+		c := newClient(t, nil)
+
+		_, err := c.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		assert.ErrorContains(t, err, "failed to update application spec")
+	})
 }
