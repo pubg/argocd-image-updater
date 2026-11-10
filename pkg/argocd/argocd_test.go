@@ -1308,3 +1308,132 @@ func Test_parseImageList(t *testing.T) {
 		assert.Equal(t, "baz", imgs[0].KustomizeImage.ImageName)
 	})
 }
+
+func TestKubernetesClientUpdateSpecIfUnchanged(t *testing.T) {
+	baseSpec := func() v1alpha1.ApplicationSpec {
+		return v1alpha1.ApplicationSpec{
+			Source: &v1alpha1.ApplicationSource{
+				RepoURL: "https://example.com/charts",
+				Chart:   "demo",
+				Helm: &v1alpha1.ApplicationSourceHelm{
+					Parameters: []v1alpha1.HelmParameter{{Name: "image.tag", Value: "1.0.0", ForceString: true}},
+				},
+			},
+			Destination: v1alpha1.ApplicationDestination{Server: "https://kubernetes.default.svc", Namespace: "old-ns"},
+		}
+	}
+	newApp := func() *v1alpha1.Application {
+		spec := baseSpec()
+		spec.Source.Helm.Parameters[0].Value = "1.0.1"
+		return &v1alpha1.Application{
+			ObjectMeta: v1.ObjectMeta{Name: "test-app", Namespace: "testns"},
+			Spec:       spec,
+		}
+	}
+	newClient := func(t *testing.T, clientset *fake.Clientset) *k8sClient {
+		t.Helper()
+		client, err := NewK8SClient(&kube.ImageUpdaterKubernetesClient{ApplicationsClientset: clientset}, nil)
+		require.NoError(t, err)
+		return client.(*k8sClient)
+	}
+	getLive := func(t *testing.T, clientset *fake.Clientset) *v1alpha1.Application {
+		t.Helper()
+		live, err := clientset.ArgoprojV1alpha1().Applications("testns").Get(context.Background(), "test-app", v1.GetOptions{})
+		require.NoError(t, err)
+		return live
+	}
+
+	t.Run("Writes the spec and keeps the live status when the spec is unchanged", func(t *testing.T) {
+		base := baseSpec()
+		clientset := fake.NewSimpleClientset(&v1alpha1.Application{
+			ObjectMeta: v1.ObjectMeta{Name: "test-app", Namespace: "testns"},
+			Spec:       base,
+			Status:     v1alpha1.ApplicationStatus{Sync: v1alpha1.SyncStatus{Status: v1alpha1.SyncStatusCodeSynced}},
+		})
+		client := newClient(t, clientset)
+
+		spec, err := client.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		require.NoError(t, err)
+		assert.Equal(t, "1.0.1", spec.Source.Helm.Parameters[0].Value)
+
+		live := getLive(t, clientset)
+		assert.Equal(t, "1.0.1", live.Spec.Source.Helm.Parameters[0].Value)
+		assert.Equal(t, v1alpha1.SyncStatusCodeSynced, live.Status.Sync.Status)
+	})
+
+	t.Run("Does not revert a spec change made by another client after the spec was read", func(t *testing.T) {
+		base := baseSpec()
+		changed := baseSpec()
+		changed.Destination.Namespace = "new-ns"
+		clientset := fake.NewSimpleClientset(&v1alpha1.Application{
+			ObjectMeta: v1.ObjectMeta{Name: "test-app", Namespace: "testns"},
+			Spec:       changed,
+		})
+		client := newClient(t, clientset)
+
+		_, err := client.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		require.ErrorIs(t, err, ErrSpecChanged)
+
+		live := getLive(t, clientset)
+		assert.Equal(t, "new-ns", live.Spec.Destination.Namespace)
+		assert.Equal(t, "1.0.0", live.Spec.Source.Helm.Parameters[0].Value)
+	})
+
+	t.Run("Compares the spec again after a conflict", func(t *testing.T) {
+		base := baseSpec()
+		clientset := fake.NewSimpleClientset(&v1alpha1.Application{
+			ObjectMeta: v1.ObjectMeta{Name: "test-app", Namespace: "testns"},
+			Spec:       base,
+		})
+		tracker := clientset.Tracker()
+		attempts := 0
+		clientset.PrependReactor("update", "applications", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			attempts++
+			// Another client changes the spec between our Get and Update.
+			changed := baseSpec()
+			changed.Destination.Namespace = "new-ns"
+			gvr := v1alpha1.SchemeGroupVersion.WithResource("applications")
+			require.NoError(t, tracker.Update(gvr, &v1alpha1.Application{
+				ObjectMeta: v1.ObjectMeta{Name: "test-app", Namespace: "testns"},
+				Spec:       changed,
+			}, "testns"))
+			return true, nil, errors.NewConflict(schema.GroupResource{Group: "argoproj.io", Resource: "applications"}, "test-app", fmt.Errorf("conflict"))
+		})
+		client := newClient(t, clientset)
+
+		_, err := client.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		require.ErrorIs(t, err, ErrSpecChanged)
+		assert.Equal(t, 1, attempts)
+		assert.Equal(t, "new-ns", getLive(t, clientset).Spec.Destination.Namespace)
+	})
+
+	t.Run("Retries a conflict when the spec is still unchanged", func(t *testing.T) {
+		base := baseSpec()
+		clientset := fake.NewSimpleClientset(&v1alpha1.Application{
+			ObjectMeta: v1.ObjectMeta{Name: "test-app", Namespace: "testns"},
+			Spec:       base,
+		})
+		attempts := 0
+		clientset.PrependReactor("update", "applications", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			attempts++
+			if attempts == 1 {
+				return true, nil, errors.NewConflict(schema.GroupResource{Group: "argoproj.io", Resource: "applications"}, "test-app", fmt.Errorf("conflict"))
+			}
+			return false, nil, nil
+		})
+		client := newClient(t, clientset)
+
+		_, err := client.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		require.NoError(t, err)
+		assert.Equal(t, 2, attempts)
+		assert.Equal(t, "1.0.1", getLive(t, clientset).Spec.Source.Helm.Parameters[0].Value)
+	})
+
+	t.Run("Returns an error when the application does not exist", func(t *testing.T) {
+		base := baseSpec()
+		client := newClient(t, fake.NewSimpleClientset())
+
+		_, err := client.UpdateSpecIfUnchanged(context.Background(), newApp(), &base)
+		assert.ErrorContains(t, err, "error getting application")
+	})
+}

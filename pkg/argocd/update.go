@@ -3,6 +3,7 @@ package argocd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -92,6 +93,10 @@ type WriteBackConfig struct {
 	Target                 string
 	GitRepo                string
 	GitCreds               git.CredsStore
+	// BaseSpec is the Application spec the update was computed from. If set
+	// and ArgoClient supports it, the live spec is only written while it
+	// still equals BaseSpec.
+	BaseSpec *v1alpha1.ApplicationSpec
 }
 
 // The following are helper structs to only marshal the fields we require
@@ -162,6 +167,7 @@ func UpdateApplication(updateConf *UpdateConfiguration, state *SyncIterationStat
 	result := ImageUpdaterResult{}
 	app := updateConf.UpdateApp.Application.GetName()
 	changeList := make([]ChangeEntry, 0)
+	baseSpec := updateConf.UpdateApp.Application.Spec.DeepCopy()
 
 	// Get all images that are deployed with the current application
 	applicationImages := GetImagesFromApplication(&updateConf.UpdateApp.Application)
@@ -333,6 +339,7 @@ func UpdateApplication(updateConf *UpdateConfiguration, state *SyncIterationStat
 	if err != nil {
 		return result
 	}
+	wbc.BaseSpec = baseSpec
 	if updateConf.GitCreds == nil {
 		wbc.GitCreds = git.NoopCredsStore{}
 	} else {
@@ -362,7 +369,10 @@ func UpdateApplication(updateConf *UpdateConfiguration, state *SyncIterationStat
 		if !updateConf.DryRun {
 			logCtx.Infof("Committing %d parameter update(s) for application %s", result.NumImagesUpdated, app)
 			err := commitChangesLocked(&updateConf.UpdateApp.Application, wbc, state, changeList)
-			if err != nil {
+			if errors.Is(err, ErrSpecChanged) {
+				logCtx.Warnf("Application spec was changed by another client during this cycle, not updating it until the next cycle")
+				result.NumImagesUpdated = 0
+			} else if err != nil {
 				logCtx.Errorf("Could not update application spec: %v", err)
 				result.NumErrors += 1
 				result.NumImagesUpdated = 0
@@ -998,11 +1008,16 @@ func commitChangesLocked(app *v1alpha1.Application, wbc *WriteBackConfig, state 
 func commitChanges(app *v1alpha1.Application, wbc *WriteBackConfig, changeList []ChangeEntry) error {
 	switch wbc.Method {
 	case WriteBackApplication:
-		_, err := wbc.ArgoClient.UpdateSpec(context.TODO(), &application.ApplicationUpdateSpecRequest{
-			Name:         &app.Name,
-			AppNamespace: &app.Namespace,
-			Spec:         &app.Spec,
-		})
+		var err error
+		if updater, ok := wbc.ArgoClient.(ConditionalSpecUpdater); ok && wbc.BaseSpec != nil {
+			_, err = updater.UpdateSpecIfUnchanged(context.TODO(), app, wbc.BaseSpec)
+		} else {
+			_, err = wbc.ArgoClient.UpdateSpec(context.TODO(), &application.ApplicationUpdateSpecRequest{
+				Name:         &app.Name,
+				AppNamespace: &app.Namespace,
+				Spec:         &app.Spec,
+			})
+		}
 		if err != nil {
 			return err
 		}

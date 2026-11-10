@@ -2,6 +2,7 @@ package argocd
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	argocdclient "github.com/argoproj/argo-cd/v3/pkg/apiclient"
 	"github.com/argoproj/argo-cd/v3/pkg/apiclient/application"
 	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -105,6 +107,55 @@ func (client *k8sClient) UpdateSpec(ctx context.Context, spec *application.Appli
 		return &updatedApp.Spec, nil
 	}
 	return nil, fmt.Errorf("max retries(%d) reached while updating application: %s", maxRetries, spec.GetName())
+}
+
+// ErrSpecChanged is returned when another client changed the Application spec
+// after it was read for the current update cycle.
+var ErrSpecChanged = goerrors.New("application spec was changed after it was read")
+
+// ConditionalSpecUpdater writes a new Application spec only while the live
+// spec still equals the spec the new one was computed from.
+type ConditionalSpecUpdater interface {
+	UpdateSpecIfUnchanged(ctx context.Context, app *v1alpha1.Application, baseSpec *v1alpha1.ApplicationSpec) (*v1alpha1.ApplicationSpec, error)
+}
+
+// UpdateSpecIfUnchanged writes app.Spec if the live spec still equals baseSpec
+// and returns ErrSpecChanged otherwise.
+//
+// UpdateSpec puts the spec read at the start of the cycle onto a freshly read
+// object, so the update carries the latest resourceVersion and silently reverts
+// spec changes made by other clients in the meantime. Comparing specs instead
+// of resourceVersions lets status-only changes by the application controller
+// through.
+func (client *k8sClient) UpdateSpecIfUnchanged(ctx context.Context, app *v1alpha1.Application, baseSpec *v1alpha1.ApplicationSpec) (*v1alpha1.ApplicationSpec, error) {
+	const defaultMaxRetries = 7
+	const baseDelay = 100 * time.Millisecond
+
+	maxRetries := env.ParseNumFromEnv("OVERRIDE_MAX_RETRIES", defaultMaxRetries, 0, 100)
+	apps := client.kubeClient.ApplicationsClientset.ArgoprojV1alpha1().Applications(app.Namespace)
+
+	for attempts := 0; attempts < maxRetries; attempts++ {
+		live, err := apps.Get(ctx, app.Name, v1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("error getting application: %w", err)
+		}
+		if !equality.Semantic.DeepEqual(live.Spec, *baseSpec) {
+			return nil, ErrSpecChanged
+		}
+		live.Spec = *app.Spec.DeepCopy()
+
+		updatedApp, err := apps.Update(ctx, live, v1.UpdateOptions{})
+		if err != nil {
+			if errors.IsConflict(err) {
+				log.Warnf("conflict occurred while updating application: %s, retrying... (%d/%d)", app.Name, attempts+1, maxRetries)
+				time.Sleep(baseDelay * (1 << attempts))
+				continue
+			}
+			return nil, fmt.Errorf("error updating application: %w", err)
+		}
+		return &updatedApp.Spec, nil
+	}
+	return nil, fmt.Errorf("max retries(%d) reached while updating application: %s", maxRetries, app.Name)
 }
 
 type K8SClientOptions struct {

@@ -1,6 +1,7 @@
 package argocd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/argoproj/argo-cd/v3/pkg/apiclient/application"
 	"github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+	argofake "github.com/argoproj/argo-cd/v3/pkg/client/clientset/versioned/fake"
 	"github.com/distribution/distribution/v3/manifest/schema1" //nolint:staticcheck
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -1336,6 +1338,96 @@ func Test_UpdateApplication(t *testing.T) {
 			"Image should still contain 'latest-bookworm' after second update cycle")
 	})
 
+}
+
+func Test_UpdateApplicationConcurrentSpecChange(t *testing.T) {
+	const ns = "argocd"
+	annotations := map[string]string{
+		common.ImageUpdaterAnnotation: "demo=gcr.io/example/demo",
+	}
+	initialApp := &v1alpha1.Application{
+		ObjectMeta: v1.ObjectMeta{Name: "demo", Namespace: ns, Annotations: annotations},
+		Spec: v1alpha1.ApplicationSpec{
+			Source: &v1alpha1.ApplicationSource{
+				RepoURL: "https://example.com/charts",
+				Chart:   "demo",
+				Helm: &v1alpha1.ApplicationSourceHelm{
+					Parameters: []v1alpha1.HelmParameter{
+						{Name: "image.name", Value: "gcr.io/example/demo", ForceString: true},
+						{Name: "image.tag", Value: "1.0.0", ForceString: true},
+					},
+				},
+			},
+			Destination: v1alpha1.ApplicationDestination{Server: "https://kubernetes.default.svc", Namespace: "old-ns"},
+		},
+		Status: v1alpha1.ApplicationStatus{
+			SourceType: v1alpha1.ApplicationSourceTypeHelm,
+			Summary:    v1alpha1.ApplicationSummary{Images: []string{"gcr.io/example/demo:1.0.0"}},
+		},
+	}
+
+	appClientset := argofake.NewSimpleClientset(initialApp)
+	argoClient, err := NewK8SClient(&kube.ImageUpdaterKubernetesClient{ApplicationsClientset: appClientset}, nil)
+	require.NoError(t, err)
+	kubeClient := kube.ImageUpdaterKubernetesClient{
+		KubeClient:            &registryKube.KubernetesClient{Clientset: fake.NewFakeKubeClient()},
+		ApplicationsClientset: appClientset,
+	}
+	apps := appClientset.ArgoprojV1alpha1().Applications(ns)
+
+	runCycle := func(t *testing.T, duringRegistryLookup func()) ImageUpdaterResult {
+		t.Helper()
+		listed, err := argoClient.ListApplications("")
+		require.NoError(t, err)
+		appList, err := FilterApplicationsForUpdate(listed, nil)
+		require.NoError(t, err)
+		appImages := appList[ns+"/demo"]
+
+		mockClientFn := func(endpoint *registry.RegistryEndpoint, username, password string) (registry.RegistryClient, error) {
+			regMock := regmock.RegistryClient{}
+			regMock.On("NewRepository", mock.Anything).Return(nil)
+			regMock.On("Tags", mock.Anything).Run(func(mock.Arguments) {
+				if duringRegistryLookup != nil {
+					duringRegistryLookup()
+				}
+			}).Return([]string{"1.0.0", "1.0.1"}, nil)
+			return &regMock, nil
+		}
+		return UpdateApplication(&UpdateConfiguration{
+			NewRegFN:          mockClientFn,
+			ArgoClient:        argoClient,
+			KubeClient:        &kubeClient,
+			UpdateApp:         &appImages,
+			DisableKubeEvents: true,
+		}, NewSyncIterationState())
+	}
+
+	// Another client (for example Terraform) changes the destination after the
+	// cycle listed the Application and before it writes the new image tag.
+	res := runCycle(t, func() {
+		live, err := apps.Get(context.Background(), "demo", v1.GetOptions{})
+		require.NoError(t, err)
+		live.Spec.Destination.Namespace = "new-ns"
+		_, err = apps.Update(context.Background(), live, v1.UpdateOptions{})
+		require.NoError(t, err)
+	})
+	assert.Equal(t, 0, res.NumErrors)
+	assert.Equal(t, 0, res.NumImagesUpdated)
+
+	live, err := apps.Get(context.Background(), "demo", v1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "new-ns", live.Spec.Destination.Namespace, "concurrent spec change must not be reverted")
+	assert.Equal(t, "1.0.0", live.Spec.Source.Helm.Parameters[1].Value)
+
+	// The next cycle reads the new spec and writes the new tag on top of it.
+	res = runCycle(t, nil)
+	assert.Equal(t, 0, res.NumErrors)
+	assert.Equal(t, 1, res.NumImagesUpdated)
+
+	live, err = apps.Get(context.Background(), "demo", v1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "new-ns", live.Spec.Destination.Namespace)
+	assert.Equal(t, "1.0.1", live.Spec.Source.Helm.Parameters[1].Value)
 }
 
 func Test_MarshalParamsOverride(t *testing.T) {
